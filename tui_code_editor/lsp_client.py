@@ -92,6 +92,14 @@ class SimpleLSPClient:
             self._pending.pop(mid, None)
             raise
 
+    async def send_request_and_resolve(self, method: str, params: dict=None, timeout: float=5.0) -> Any:
+        res = await self.send_request(method, params=params, timeout=timeout)
+        # If it's a completion that supports resolve, try resolve if items are incomplete
+        if method == 'textDocument/completion' and isinstance(res, list):
+            # naive: return as-is
+            return res
+        return res
+
     async def _write(self, msg: dict):
         encoded = json.dumps(msg).encode('utf-8')
         header = f'Content-Length: {len(encoded)}\r\n\r\n'.encode('utf-8')

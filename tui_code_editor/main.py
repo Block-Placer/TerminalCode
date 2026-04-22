@@ -170,7 +170,7 @@ class EditorApp:
         def _(event):
             self.file_explorer.text = self._build_file_list()
 
-        @kb.add('c-`')
+        @kb.add('f3')
         def _(event):
             if not self.terminal_session_started:
                 try:
@@ -224,7 +224,29 @@ class EditorApp:
         self.application = Application(layout=Layout(root_container), key_bindings=kb, full_screen=True, style=self.style)
         try:
             loop = asyncio.get_event_loop()
-            self._watch_task = loop.create_task(self._watch_files())
+            try:
+                from watchdog.observers import Observer
+                from watchdog.events import FileSystemEventHandler
+
+                class _Handler(FileSystemEventHandler):
+                    def __init__(self, app: 'EditorApp'):
+                        self.app = app
+
+                    def on_any_event(self, event):
+                        try:
+                            self.app.file_explorer.text = self.app._build_file_list()
+                        except Exception:
+                            pass
+
+                observer = Observer()
+                handler = _Handler(self)
+                observer.schedule(handler, str(self.root), recursive=False)
+                observer.daemon = True
+                observer.start()
+                self._watch_task = None
+                self._fs_observer = observer
+            except Exception:
+                self._watch_task = loop.create_task(self._watch_files())
         except Exception:
             self._watch_task = None
 
@@ -241,6 +263,33 @@ class EditorApp:
             buff.text = ''
         try:
             self.terminal_input.buffer.accept_handler = _accept_terminal
+        except Exception:
+            pass
+        try:
+            # forward typed characters incrementally for interactive terminal
+            def _term_change(_):
+                try:
+                    text = self.terminal_input.text
+                    # send only the delta
+                    # simple heuristic: if new text extends previous, send tail
+                    if not hasattr(self, '_terminal_prev'):
+                        self._terminal_prev = ''
+                    prev = self._terminal_prev
+                    if text.startswith(prev):
+                        tail = text[len(prev):]
+                        if tail:
+                            self.terminal.write_input(tail)
+                    else:
+                        # fallback: send whole text and reset
+                        self.terminal.write_input(text)
+                    self._terminal_prev = text
+                except Exception:
+                    pass
+            try:
+                self.terminal_input.buffer.on_text_changed += _term_change
+            except Exception:
+                # older/newer prompt_toolkit may use different API; ignore if unavailable
+                pass
         except Exception:
             pass
 
@@ -311,7 +360,9 @@ class EditorApp:
     def _on_buffer_change(self, tab: Tab):
         tab.dirty = True
         if self.lsp and tab.path:
-            asyncio.get_event_loop().create_task(self.lsp.send_notification('textDocument/didChange', {'textDocument': {'uri': tab.path.as_uri(), 'version': 1}, 'contentChanges': [{'text': tab.buffer.text}]}))
+            v = self._doc_versions.get(tab.path.as_posix(), 0) + 1
+            self._doc_versions[tab.path.as_posix()] = v
+            asyncio.get_event_loop().create_task(self.lsp.send_notification('textDocument/didChange', {'textDocument': {'uri': tab.path.as_uri(), 'version': v}, 'contentChanges': [{'text': tab.buffer.text}]}))
 
     async def _lsp_completion(self):
         if not self.lsp or not self.open_tabs:
@@ -345,12 +396,14 @@ class EditorApp:
             label = it.get('label') if isinstance(it, dict) else str(it)
             insert = None
             edit = None
+            fmt = None
             if isinstance(it, dict):
                 insert = it.get('insertText') or it.get('label')
                 te = it.get('textEdit')
                 if te and isinstance(te, dict):
                     edit = te
-            choices.append((label, insert, edit))
+                fmt = it.get('insertTextFormat')
+            choices.append((label, insert, edit, fmt, it))
         if not choices:
             self.status.text = 'No completions'
             return
@@ -363,10 +416,25 @@ class EditorApp:
         idx = int(result)
         chosen = choices[idx][1]
         edit = choices[idx][2]
+        fmt = choices[idx][3]
+        raw = choices[idx][4]
         if chosen is None:
             return
         try:
             doc = tab.buffer.document
+            # try resolve if server supports it and item looks resolvable
+            if isinstance(raw, dict):
+                try:
+                    resolved = await self.lsp.send_request('completionItem/resolve', raw, timeout=1.0)
+                    if isinstance(resolved, dict):
+                        # update chosen/edit/format from resolved
+                        chosen = resolved.get('insertText') or resolved.get('label') or chosen
+                        te = resolved.get('textEdit')
+                        if te and isinstance(te, dict):
+                            edit = te
+                        fmt = resolved.get('insertTextFormat', fmt)
+                except Exception:
+                    pass
             if edit:
                 new_text = edit.get('newText')
                 rng = edit.get('range')
@@ -378,11 +446,11 @@ class EditorApp:
                         schar = start.get('character', 0)
                         eline = end.get('line', 0)
                         echar = end.get('character', 0)
-                        try:
-                            start_offset = doc.translate_row_col_to_index(sline, schar)
-                            end_offset = doc.translate_row_col_to_index(eline, echar)
-                            # perform replacement
-                            tab.buffer.delete(start_offset, end_offset - start_offset)
+                            try:
+                                start_offset = doc.translate_row_col_to_index(sline, schar)
+                                end_offset = doc.translate_row_col_to_index(eline, echar)
+                                # perform replacement
+                                tab.buffer.delete(start_offset, end_offset - start_offset)
                             tab.buffer.insert_text(new_text, overwrite=False)
                         except Exception:
                             tab.buffer.insert_text(chosen)
@@ -510,6 +578,7 @@ class EditorApp:
             tab = self.open_tabs[self.current]
             if tab and tab.path:
                 uri = tab.path.as_uri()
+                self._doc_versions[tab.path.as_posix()] = 1
                 await self.lsp.send_notification('textDocument/didOpen', {'textDocument': {'uri': uri, 'languageId': 'python', 'version': 1, 'text': tab.buffer.text}})
         except Exception as e:
             self.status.text = f'LSP start failed: {e}'
