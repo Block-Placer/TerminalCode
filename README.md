@@ -41,5 +41,8 @@ Run
 Notes on LSP
 This project contains a minimal LSP client skeleton in tui_code_editor/lsp_client.py. It demonstrates launching a language server as a subprocess and exchanging JSON-RPC messages. It is intentionally small — a production-ready LSP client needs full message handling, request/response ID management, capabilities, and robust error handling.
 
+Contributors
+Block-Placer
+
 Contributions
 This scaffold aims to be a starting point. If you want richer editing features (Undo/Redo history, code-completion, diagnostics, real PTY terminal, language integrations), we can add them incrementally.
