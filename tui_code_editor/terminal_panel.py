@@ -1,37 +1,26 @@
-"""Terminal panel with PTY support for interactive shells and command execution."""
 from __future__ import annotations
-
 import asyncio
 import os
 import pty
 import select
 import tty
 from typing import Optional, Callable
-
+import fcntl
+import struct
 
 class TerminalPanel:
-    """TerminalPanel supports both one-shot runs and persistent PTY sessions.
-
-    Methods:
-    - run(cmd): run command and return output when finished
-    - start_session(cmd, on_output): start persistent PTY session and call on_output(str) with incremental output
-    - write_input(data): write bytes/str to PTY
-    - stop_session(): stop PTY session
-    """
 
     def __init__(self):
-        self.output = ""
+        self.output = ''
         self._master_fd: Optional[int] = None
         self._proc_pid: Optional[int] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._on_output: Optional[Callable[[str], None]] = None
 
-    async def run(self, cmd: str, timeout: float = 10.0) -> str:
-        # run command via /bin/sh -c inside a spawned pty so interactive programs work
+    async def run(self, cmd: str, timeout: float=10.0) -> str:
         master, slave = pty.openpty()
         pid = os.fork()
         if pid == 0:
-            # child
             os.setsid()
             os.dup2(slave, 0)
             os.dup2(slave, 1)
@@ -42,11 +31,9 @@ class TerminalPanel:
                 pass
             os.execvp('/bin/sh', ['/bin/sh', '-c', cmd])
         else:
-            # parent
             os.close(slave)
-            output = b""
+            output = b''
             try:
-                # read until process exits or timeout
                 while True:
                     r, _, _ = select.select([master], [], [], 0.1)
                     if master in r:
@@ -54,7 +41,6 @@ class TerminalPanel:
                         if not data:
                             break
                         output += data
-                    # check if child exited
                     try:
                         pid_done, status = os.waitpid(pid, os.WNOHANG)
                         if pid_done == pid:
@@ -72,15 +58,12 @@ class TerminalPanel:
                 self.output = str(output)
             return self.output
 
-    def start_session(self, cmd: str, on_output: Optional[Callable[[str], None]] = None) -> None:
-        """Start a persistent PTY session. on_output will be called with incremental output."""
+    def start_session(self, cmd: str, on_output: Optional[Callable[[str], None]]=None) -> None:
         if self._master_fd is not None:
-            # already running
             return
         master, slave = pty.openpty()
         pid = os.fork()
         if pid == 0:
-            # child
             os.setsid()
             os.dup2(slave, 0)
             os.dup2(slave, 1)
@@ -117,10 +100,10 @@ class TerminalPanel:
                     self.output += text
                     if self._on_output:
                         try:
-                            self._on_output(self.output)
+                            # send incremental chunk instead of entire buffer
+                            self._on_output(text)
                         except Exception:
                             pass
-                # check if child exited
                 try:
                     pid_done, status = os.waitpid(self._proc_pid or -1, os.WNOHANG)
                     if pid_done and pid_done == self._proc_pid:
@@ -143,6 +126,20 @@ class TerminalPanel:
             os.write(self._master_fd, data.encode('utf-8'))
         except Exception:
             pass
+
+    def resize(self, rows: int, cols: int) -> None:
+        if self._master_fd is None:
+            return
+        try:
+            fmt = 'HHHH'
+            buf = struct.pack(fmt, rows, cols, 0, 0)
+            fcntl.ioctl(self._master_fd, getattr(termios, 'TIOCSWINSZ', 0x5414), buf)
+        except Exception:
+            try:
+                # fallback generic ioctl number
+                fcntl.ioctl(self._master_fd, 0x5414, struct.pack('HHHH', rows, cols, 0, 0))
+            except Exception:
+                pass
 
     def stop_session(self) -> None:
         try:
